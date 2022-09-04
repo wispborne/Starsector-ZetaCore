@@ -1,0 +1,2 @@
+This bot stores your user id (eg 142592906178330624) and the date/time it last sent you messages.
+That's all.

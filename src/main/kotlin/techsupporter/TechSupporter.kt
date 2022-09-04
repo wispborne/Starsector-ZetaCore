@@ -19,31 +19,38 @@ import kotlin.time.Duration.Companion.seconds
  * - Periodic file cleanup.
  */
 class TechSupporter {
-    private val techSupportChannelId = 432809739164844032 // 619635013201428481
+    private val techSupportChannelId = 609083892409958405 // 619635013201428481
+    private val supportRoleId = 244528935558184960
+    private val comsecRoleId = 552191022885634059
     private val ignoreListFile: Path = Path.of("userIgnoreList.json")
     private val archiveTypes = """(\.zip|\.7z|\.rar)?"""
     private val wrongLogfileRegex = Regex("""starsector\.log\.\d$archiveTypes""", RegexOption.IGNORE_CASE)
     private val validLogfileRegex = Regex("""starsector(\.log)?$archiveTypes""", RegexOption.IGNORE_CASE)
+
     val repo = RepoWithCache<TechSupporterDatabase>(ignoreListFile.toFile(), TechSupporterDatabase.serializer())
 
     private var scope = CoroutineScope(Job())
 
     /**
-     * 1. If account joined more than X hours ago, disregard it.
-     * 2. Don't send the Welcome message to an account more than once.
-     * 3. Don't send the Welcome message to an account if their first message includes a starsector.log.
-     * 4. Only send the Wrong File message, not the Welcome message, if their first message includes the wrong log file.
+     * - Don't send the "welcome" message to an account more than once.
+     * - Don't send the "welcome" message to an account if their first message includes a starsector.log.
+     * - Send the "wrong logfile" message every time it happens.
      *
      * Need to track when each type of message was last sent (to avoid repeats and for later cleanup).
      */
     @OptIn(ExperimentalStdlibApi::class)
     suspend fun start(client: GatewayDiscordClient, config: Config) {
         val cutoffPoint = Instant.now().minus(Duration.ofHours(24))
+        val rolesThatKnowThings = listOf(supportRoleId, comsecRoleId)
 
         scope = CoroutineScope(Job())
         client.on(MessageCreateEvent::class.java)
             .filter { it.message.channelId.asLong() == techSupportChannelId }
             .filter { !it.message.author.get().isBot }
+            .filter { event ->
+                val roleIds = event.member.getOrNull()?.roleIds?.map { it.asLong() }.orEmpty()
+                roleIds.intersect(rolesThatKnowThings).isEmpty()
+            }
 //            .filter { it.message.authorAsMember.block()?.joinTime?.getOrNull()?.isAfter(cutoffPoint) ?: false }
             .subscribe { event ->
                 scope.launch(Dispatchers.Default) {
