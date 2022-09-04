@@ -6,16 +6,13 @@ import discord4j.core.event.domain.message.MessageCreateEvent
 import discord4j.core.`object`.entity.Message
 import discord4j.core.`object`.entity.channel.MessageChannel
 import discord4j.core.spec.MessageCreateSpec
-import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.decodeFromStream
-import kotlinx.serialization.json.encodeToStream
+import kotlinx.coroutines.*
 import util.ktx.Timber
 import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
-import kotlin.io.path.exists
 import kotlin.jvm.optionals.getOrNull
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * - Save file in memory, do batched writing.
@@ -27,6 +24,9 @@ class TechSupporter {
     private val archiveTypes = """(\.zip|\.7z|\.rar)?"""
     private val wrongLogfileRegex = Regex("""starsector\.log\.\d$archiveTypes""", RegexOption.IGNORE_CASE)
     private val validLogfileRegex = Regex("""starsector(\.log)?$archiveTypes""", RegexOption.IGNORE_CASE)
+    val repo = RepoWithCache<TechSupporterDatabase>(ignoreListFile.toFile(), TechSupporterDatabase.serializer())
+
+    private var scope = CoroutineScope(Job())
 
     /**
      * 1. If account joined more than X hours ago, disregard it.
@@ -37,52 +37,63 @@ class TechSupporter {
      * Need to track when each type of message was last sent (to avoid repeats and for later cleanup).
      */
     @OptIn(ExperimentalStdlibApi::class)
-    fun start(client: GatewayDiscordClient, config: Config) {
+    suspend fun start(client: GatewayDiscordClient, config: Config) {
         val cutoffPoint = Instant.now().minus(Duration.ofHours(24))
 
+        scope = CoroutineScope(Job())
         client.on(MessageCreateEvent::class.java)
             .filter { it.message.channelId.asLong() == techSupportChannelId }
             .filter { !it.message.author.get().isBot }
 //            .filter { it.message.authorAsMember.block()?.joinTime?.getOrNull()?.isAfter(cutoffPoint) ?: false }
             .subscribe { event ->
-                kotlin.runCatching {
-                    event ?: return@subscribe
-                    val message = event.message
-                    val user = message.author.getOrNull() ?: return@subscribe
+                scope.launch(Dispatchers.Default) {
+                    kotlin.runCatching {
+                        withTimeout(timeout = 15.seconds) {
+                            event ?: return@withTimeout
+                            val message = event.message
+                            val user = message.author.getOrNull() ?: return@withTimeout
 
-                    Timber.d { "${user.username} wrote '${message.content}' with attachments '${message.attachments.joinToString { it.filename }}'." }
+                            Timber.d { "${user.username} wrote '${message.content}' with attachments '${message.attachments.joinToString { it.filename }}'." }
 
-                    val ignoreFile = readIgnoreFile()
-                    val hasAlreadySentWelcome = ignoreFile.users[user.id.asString()]?.lastWelcomeMsgTimestamp != null
+                            val ignoreFile = readIgnoreFile()
+                            val userInDb = ignoreFile.users[user.id.asString()]
+                            val hasAlreadySentWelcome = userInDb?.lastWelcomeMsgTimestamp != null
 
-                    val channel = message.channel.block()
-                    val hasWrongLogFile = hasWrongLogFile(message = message)
-                    val hasValidLogFile = hasValidLogFile(message = message)
+                            val channel = message.channel.block()
+                            val hasWrongLogFile = hasWrongLogFile(message = message)
+                            val hasValidLogFile = hasValidLogFile(message = message)
 
-                    // If they included a valid logfile, don't bug them with welcome message.
-                    if (hasValidLogFile) {
-                        upsertUser(
-                            (ignoreFile.users[user.id.asString()] ?: User(user.id.asString()).copy(
-                                lastWelcomeMsgTimestamp = Instant.now().epochSecond
-                            ))
-                        )
+                            // If they included a valid logfile, don't bug them with welcome message.
+                            if (hasValidLogFile) {
+                                upsertUser(
+                                    (userInDb ?: User(user.id.asString()).copy(
+                                        lastWelcomeMsgTimestamp = Instant.now().epochSecond
+                                    ))
+                                )
+                            }
+
+                            if (hasWrongLogFile) {
+                                sendMessageOnWrongLogFile(message, channel, ignoreFile, config.wrongLogMessage)
+                            } else if (!hasAlreadySentWelcome && !hasValidLogFile) {
+                                sendWelcomeMessage(
+                                    message = message,
+                                    channel = channel,
+                                    techSupporterDatabase = ignoreFile,
+                                    welcomeMessage = config.welcomeMessage
+                                )
+                            }
+                        }
                     }
-
-                    if (hasWrongLogFile) {
-                        sendMessageOnWrongLogFile(message, channel, ignoreFile, config.wrongLogMessage)
-                    } else if (!hasAlreadySentWelcome && !hasValidLogFile) {
-                        sendWelcomeMessage(
-                            message = message,
-                            channel = channel,
-                            techSupporterDatabase = ignoreFile,
-                            welcomeMessage = config.welcomeMessage
-                        )
-                    }
+                        .onFailure { Timber.w(it) }
                 }
-                    .onFailure { Timber.w(it) }
             }
     }
 
+    fun stop() {
+        Timber.i { "Stopping ${TechSupporter::class.simpleName}." }
+        scope.cancel()
+        repo.close()
+    }
 
     fun hasValidLogFile(message: Message): Boolean {
         return message.attachments.orEmpty().any { attachment ->
@@ -97,7 +108,7 @@ class TechSupporter {
     }
 
     @OptIn(ExperimentalStdlibApi::class)
-    fun sendWelcomeMessage(
+    suspend fun sendWelcomeMessage(
         message: Message,
         channel: MessageChannel?,
         techSupporterDatabase: TechSupporterDatabase,
@@ -123,7 +134,7 @@ class TechSupporter {
     }
 
     @OptIn(ExperimentalStdlibApi::class)
-    fun sendMessageOnWrongLogFile(
+    suspend fun sendMessageOnWrongLogFile(
         message: Message,
         channel: MessageChannel?,
         techSupporterDatabase: TechSupporterDatabase,
@@ -157,35 +168,14 @@ class TechSupporter {
         }
     }
 
-    @OptIn(ExperimentalSerializationApi::class)
-    fun readIgnoreFile(retries: Int = 1): TechSupporterDatabase {
-        if (retries < 0) {
-            throw RuntimeException("Unable to read file, no more retries.")
-        }
+    fun readIgnoreFile(): TechSupporterDatabase = repo.get() ?: TechSupporterDatabase()
 
-        if (!ignoreListFile.exists()) {
-            ignoreListFile.toFile().createNewFile()
-            Json.encodeToStream(TechSupporterDatabase(), ignoreListFile.toFile().outputStream())
-        }
+    suspend fun upsertUser(user: User) {
+        withContext(Dispatchers.IO) {
+            val db = readIgnoreFile()
 
-        return kotlin.runCatching {
-            Json.decodeFromStream<TechSupporterDatabase>(ignoreListFile.toFile().inputStream())
-        }
-            .recover {
-                Timber.e(it)
-                ignoreListFile.toFile().delete()
-                ignoreListFile.toFile().createNewFile()
-                Json.encodeToStream(TechSupporterDatabase(), ignoreListFile.toFile().outputStream())
-                readIgnoreFile(retries = retries - 1)
-            }
-            .getOrThrow()
-    }
-
-    @OptIn(ExperimentalSerializationApi::class)
-    fun upsertUser(user: User) {
-        readIgnoreFile().run {
-            val newUsersList = this.users.toMutableMap().apply { this[user.userId] = user }
-            Json.encodeToStream(this.copy(users = newUsersList), ignoreListFile.toFile().outputStream())
+            val newUsersList = db.users.toMutableMap().apply { this[user.userId] = user }
+            repo.set(db.copy(users = newUsersList))
         }
     }
 }

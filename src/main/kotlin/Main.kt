@@ -1,12 +1,17 @@
 import discord4j.core.DiscordClientBuilder
+import kotlinx.coroutines.*
 import techsupporter.TechSupporter
 import util.LogLevel
 import util.Timber
 import java.nio.file.Path
 import java.util.*
+import kotlin.concurrent.thread
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.bufferedReader
 import kotlin.io.path.exists
+
+val job = SupervisorJob()
+val scope = CoroutineScope(job)
 
 fun main(args: Array<String>) {
     println("Hello World!")
@@ -26,9 +31,21 @@ fun main(args: Array<String>) {
         .login()
         .block() ?: throw NullPointerException("Discord client was null.")
 
-    TechSupporter().start(client, config)
+    val techSupporter = TechSupporter()
 
-    client.onDisconnect().block()
+//    Runtime.getRuntime().addShutdownHook(thread {
+//        client.onDisconnect().block()
+//    })
+
+    scope.launch {
+        techSupporter.start(client, config)
+    }
+
+    runBlocking {
+        while (true) {
+            delay(10)
+        }
+    }
 }
 
 object Main {

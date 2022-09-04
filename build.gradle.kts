@@ -31,8 +31,6 @@ dependencies {
     implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
 
     implementation("com.discord4j:discord4j-core:3.2.3")
-
-    implementation("org.litote.kmongo:kmongo-coroutine-serialization:4.7.0")
 }
 
 
